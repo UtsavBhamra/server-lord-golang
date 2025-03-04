@@ -4,16 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+    
 	"log"
 	"net/http"
 	"time"
 	"io"
+	"os"
 
 	"github.com/gorilla/mux"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"strconv"
-)
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
+)
 type User struct {
 	ID       int64  `json:"id"`
 	Username string `json:"username"`
@@ -33,7 +42,40 @@ type Task struct {
 
 var db *pgxpool.Pool
 
+func initTracer() func() {
+	// Create a stdout exporter
+	exporter, err := stdouttrace.New(
+		stdouttrace.WithPrettyPrint(), // Make it readable
+		stdouttrace.WithWriter(os.Stdout),
+	)
+	if err != nil {
+		log.Fatalf("failed to initialize stdout exporter: %v", err)
+	}
+
+	// Create trace provider
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exporter),
+		trace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("task-tracker"),
+		)),
+	)
+
+	otel.SetTracerProvider(tp)
+
+	// Return shutdown function
+	return func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Fatalf("failed to shutdown TracerProvider: %v", err)
+		}
+	}
+}
+
 func main() {
+    // Initialize the tracer
+    shutdown := initTracer()
+    defer shutdown()
+
 	// Database connection
 	dbURL := "postgres://postgres:1234@localhost:5432/task_tracker"
 	config, err := pgxpool.ParseConfig(dbURL)
@@ -59,6 +101,8 @@ func main() {
 
 	// Setup router
 	r := mux.NewRouter()
+    r.Use(otelmux.Middleware("task-tracker"))
+
 	r.HandleFunc("/register", registerHandler).Methods("POST")
 	r.HandleFunc("/tasks", createTaskHandler).Methods("POST")
 	r.HandleFunc("/users/{userId}", getUserHandler).Methods("GET")
@@ -100,22 +144,42 @@ func initDB(db *pgxpool.Pool) error {
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
+    // Start a span
+    ctx, span := otel.Tracer("task-tracker").Start(r.Context(), "registerHandler")
+    defer span.End() // Make sure the span ends
+
 	var user User
+
 	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+	query := `INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id`
+
+	// Measure database query time
+	dbCtx, dbSpan := otel.Tracer("task-tracker").Start(ctx, "dbQuery")
+	err := db.QueryRow(dbCtx, query, user.Username, user.Email).Scan(&user.ID)
+	dbSpan.End()
+
+	if err != nil {
+        dbSpan.RecordError(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	query := `INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id`
-	//instrument the time taken for the rw operations (open telemetry)
-	err := db.QueryRow(context.Background(), query, user.Username, user.Email).Scan(&user.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+    // Add attributes to DB span
+    dbSpan.SetAttributes(
+        attribute.String("query", query),
+        attribute.String("user", user.Username),
+    )
+
 	
+	// Response time measurement
+	_, respSpan := otel.Tracer("task-tracker").Start(ctx, "sendResponse")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(user)
+	respSpan.End() // Ends the response span
 }
 
 func createTaskHandler(w http.ResponseWriter, r *http.Request) {
@@ -256,6 +320,9 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
+    ctx, span := otel.Tracer("task-tracker").Start(r.Context(), "heartbeatHandler")
+    defer span.End()
+
 	vars := mux.Vars(r)
 	taskID := vars["taskId"]
 
@@ -266,14 +333,30 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		RETURNING id`
 
 	var id int64
-	err := db.QueryRow(context.Background(), query, taskID).Scan(&id)
+
+    // Instrument database query
+    dbCtx, dbSpan := otel.Tracer("task-tracker").Start(ctx, "dbQuery")
+	err := db.QueryRow(dbCtx, query, taskID).Scan(&id)  //Execute the db query
+    dbSpan.End() // Ends the database query span
+
+    //Error handling
 	if err != nil {
+        dbSpan.RecordError(err)
 		http.Error(w, "Task not found", http.StatusNotFound)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Heartbeat received"})
+    // Add attributes to DB span
+    dbSpan.SetAttributes(
+        attribute.String("query", query),
+        attribute.String("taskID", taskID),
+    )
+
+    // Instrument response writing
+    _, respSpan := otel.Tracer("task-tracker").Start(ctx, "sendResponse")
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"message": "Heartbeat received"})
+    respSpan.End() // Ends the response span
 }
 
 func checkTaskStatus() {
