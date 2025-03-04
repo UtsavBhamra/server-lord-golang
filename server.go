@@ -4,22 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-    
+    "os"
 	"log"
 	"net/http"
 	"time"
 	"io"
-	"os"
 
 	"github.com/gorilla/mux"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"strconv"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	// "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
 )
@@ -41,35 +39,49 @@ type Task struct {
 }
 
 var db *pgxpool.Pool
+type CustomSpanProcessor struct{}
 
-func initTracer() func() {
-	// Create a stdout exporter
-	exporter, err := stdouttrace.New(
-		stdouttrace.WithPrettyPrint(), // Make it readable
-		stdouttrace.WithWriter(os.Stdout),
-	)
-	if err != nil {
-		log.Fatalf("failed to initialize stdout exporter: %v", err)
+func (c *CustomSpanProcessor) OnStart(parent context.Context, span trace.ReadWriteSpan) {}
+
+func (c *CustomSpanProcessor) OnEnd(span trace.ReadOnlySpan) {
+	// Ignore internal OpenTelemetry spans (like otelmux)
+	if span.InstrumentationScope().Name == "go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux" {
+		return
 	}
 
-	// Create trace provider
+	// Get span details
+	route := span.Name()
+	startTime := span.StartTime()
+	endTime := span.EndTime()
+	duration := endTime.Sub(startTime)
+
+	// Format output
+	output := fmt.Sprintf(
+		"Route: %s | Start: %s | End: %s | Duration: %dms\n",
+		route, startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
+	)
+
+	// Write to stdout only
+	os.Stdout.WriteString(output)
+}
+
+func (c *CustomSpanProcessor) Shutdown(ctx context.Context) error  { return nil }
+func (c *CustomSpanProcessor) ForceFlush(ctx context.Context) error { return nil }
+
+// Initialize OpenTelemetry with the custom span processor
+func initTracer() func() {
 	tp := trace.NewTracerProvider(
-		trace.WithBatcher(exporter),
-		trace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String("task-tracker"),
-		)),
+		trace.WithSpanProcessor(&CustomSpanProcessor{}), // Use custom processor
+		trace.WithResource(resource.Empty()),           // No extra metadata
 	)
 
 	otel.SetTracerProvider(tp)
 
-	// Return shutdown function
 	return func() {
-		if err := tp.Shutdown(context.Background()); err != nil {
-			log.Fatalf("failed to shutdown TracerProvider: %v", err)
-		}
+		_ = tp.Shutdown(context.Background()) // No logging on shutdown
 	}
 }
+
 
 func main() {
     // Initialize the tracer
@@ -360,54 +372,72 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func checkTaskStatus() {
-    log.Println("Checking task statuses...")
-    
-    updateQuery := `
-        UPDATE tasks
-        SET status = 'dead'
-        WHERE 
-            status = 'alive' AND
-            EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > tasks.interval
-        RETURNING id;`
+	// Start an OpenTelemetry span
+	ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
+	startTime := time.Now() // Capture start time
+	
+	defer func() {
+		endTime := time.Now()
+		duration := endTime.Sub(startTime)
+		span.End()
 
-    rows, err := db.Query(context.Background(), updateQuery)
-    if err != nil {
-        log.Printf("Error updating task status: %v", err)
-        return
-    }
-    defer rows.Close()
+		// Print to stdout
+		output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
+			startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
+		)
+		os.Stdout.WriteString(output)
+	}()
 
-    var updatedTasks []int
-    for rows.Next() {
-        var taskID int
-        if err := rows.Scan(&taskID); err != nil {
-            log.Printf("Error scanning row: %v", err)
-            continue
-        }
-        updatedTasks = append(updatedTasks, taskID)
-    }
+	log.Println("Checking task statuses...")
 
-    query := `
-        SELECT id, status, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, interval FROM tasks;`
+	// Query to update tasks
+	updateQuery := `
+		UPDATE tasks
+		SET status = 'dead'
+		WHERE 
+			status = 'alive' AND
+			EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > tasks.interval
+		RETURNING id;`
 
-    rows, err = db.Query(context.Background(), query)
-    if err != nil {
-        log.Printf("Error fetching task statuses: %v", err)
-        return
-    }
-    defer rows.Close()
+	rows, err := db.Query(ctx, updateQuery)
+	if err != nil {
+		log.Printf("Error updating task status: %v", err)
+		return
+	}
+	defer rows.Close()
 
-    for rows.Next() {
-        var taskID int
-        var status string
-        var timeDiff float64
-        var interval int
-        if err := rows.Scan(&taskID, &status, &timeDiff, &interval); err != nil {
-            log.Printf("Error scanning row: %v", err)
-            continue
-        }
-        log.Printf("Task %d - Time since last ping: %.2f seconds, Interval: %d seconds, Status: %s", taskID, timeDiff, interval, status)
-    }
+	var updatedTasks []int
+	for rows.Next() {
+		var taskID int
+		if err := rows.Scan(&taskID); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+		updatedTasks = append(updatedTasks, taskID)
+	}
+
+	// Fetch all tasks with their statuses
+	query := `
+		SELECT id, status, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, interval FROM tasks;`
+
+	rows, err = db.Query(ctx, query)
+	if err != nil {
+		log.Printf("Error fetching task statuses: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var taskID int
+		var status string
+		var timeDiff float64
+		var interval int
+		if err := rows.Scan(&taskID, &status, &timeDiff, &interval); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+		log.Printf("Task %d - Time since last ping: %.2f seconds, Interval: %d seconds, Status: %s", taskID, timeDiff, interval, status)
+	}
 }
 
 func startTaskMonitor() {
