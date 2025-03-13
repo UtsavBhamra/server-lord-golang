@@ -1,18 +1,20 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
+    "context"
+    "encoding/json"
+    "fmt"
     "os"
-	"log"
-	"net/http"
-	"time"
-	"io"
+    "log"
+    "net/http"
+    "strings"
+    "time"
+    "io"
+    "sync"
 
-	"github.com/gorilla/mux"
-	"github.com/jackc/pgx/v4/pgxpool"
-	"strconv"
+    "github.com/gorilla/mux"
+    "github.com/jackc/pgx/v4/pgxpool"
+    "strconv"
 
 	"go.opentelemetry.io/otel"
 	// "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -371,107 +373,282 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
     respSpan.End() // Ends the response span
 }
 
+// taskmonitoring function
+// ShardInfo tracks monitoring information about shards
+type ShardInfo struct {
+    Name          string
+    LastMonitored time.Time
+}
+
+// Global map to track when each shard was last monitored
+var shardMonitoringInfo = make(map[string]*ShardInfo)
+var shardMutex sync.RWMutex
 
 func checkTaskStatus() {
-	// Start an OpenTelemetry span
-	ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
-	startTime := time.Now()
-	defer func() {
-		endTime := time.Now()
-		duration := endTime.Sub(startTime)
-		span.End()
+    // Start an OpenTelemetry span
+    ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
+    startTime := time.Now()
+    defer func() {
+        endTime := time.Now()
+        duration := endTime.Sub(startTime)
+        span.End()
 
-		// Print timing information
-		output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
-			startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
-		)
-		os.Stdout.WriteString(output)
-	}()
+        // Print timing information
+        output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
+            startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
+        )
+        os.Stdout.WriteString(output)
+    }()
 
-	log.Println("Fetching shards for task monitoring...")
+    log.Println("Fetching shards for task monitoring...")
 
-	// Fetch shard names from Citus metadata
-	shardQuery := `SELECT shard_name FROM citus_shards WHERE table_name = (SELECT oid FROM pg_class WHERE relname = 'tasks');`
+    // Fetch shard names from Citus metadata
+    shardQuery := `SELECT shard_name FROM citus_shards WHERE table_name = (SELECT oid FROM pg_class WHERE relname = 'tasks');`
 
-	shardRows, err := db.Query(ctx, shardQuery)
-	if err != nil {
-		log.Fatalf("Error fetching shard names: %v", err)
-	}
-	defer shardRows.Close()
+    shardRows, err := db.Query(ctx, shardQuery)
+    if err != nil {
+        log.Printf("Error fetching shard names: %v", err)
+        return
+    }
+    defer shardRows.Close()
 
-	var shards []string
-	for shardRows.Next() {
-		var shardName string
-		if err := shardRows.Scan(&shardName); err != nil {
-			log.Fatalf("Error scanning shard name: %v", err)
-		}
-		shards = append(shards, shardName)
-	}
+    var shards []string
+    for shardRows.Next() {
+        var shardName string
+        if err := shardRows.Scan(&shardName); err != nil {
+            log.Printf("Error scanning shard name: %v", err)
+            continue
+        }
+        shards = append(shards, shardName)
+    }
 
-	if len(shards) == 0 {
-		log.Println("No task shards found.")
-		return
-	}
+    if len(shards) == 0 {
+        log.Println("No task shards found.")
+        return
+    }
 
-	log.Printf("Found %d shards: %v", len(shards), shards)
+    log.Printf("Found %d shards: %v", len(shards), shards)
 
-	// Process each shard separately
-	for _, shard := range shards {
-		log.Printf("Processing shard: %s", shard)
+    // Create a semaphore with fixed capacity
+    maxConcurrentShards := 3
+    sem := make(chan struct{}, maxConcurrentShards)
+    
+    // Create a wait group to wait for all goroutines to finish
+    var wg sync.WaitGroup
 
-		// Update task statuses in this shard
-		updateQuery := fmt.Sprintf(`
-			UPDATE %s
-			SET status = 'dead'
-			WHERE 
-				status = 'alive' 
-				AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > interval
-			RETURNING id;`, shard)
+    // Track monitoring stats
+    var monitoringSummary struct {
+        sync.Mutex
+        TotalTasks     int
+        AliveTasks     int
+        DeadTasks      int
+        UpdatedTasks   int
+        WarningTasks   int  // Tasks approaching their timeout
+    }
 
-		updateRows, err := db.Query(ctx, updateQuery)
-		if err != nil {
-			log.Printf("Error updating tasks in shard %s: %v", shard, err)
-			continue
-		}
-		defer updateRows.Close()
+    // Process each shard
+    for _, shard := range shards {
+        // Check if this shard needs monitoring
+        shardMutex.RLock()
+        info, exists := shardMonitoringInfo[shard]
+        needsMonitoring := !exists || time.Since(info.LastMonitored) > 15*time.Second
+        shardMutex.RUnlock()
 
-		var updatedTasks []int
-		for updateRows.Next() {
-			var taskID int
-			if err := updateRows.Scan(&taskID); err != nil {
-				log.Printf("Error scanning updated task ID in shard %s: %v", shard, err)
-				continue
-			}
-			updatedTasks = append(updatedTasks, taskID)
-		}
+        if !needsMonitoring {
+            log.Printf("Skipping shard %s - recently monitored at %v", shard, info.LastMonitored)
+            continue
+        }
 
-		// log.Printf("Shard %s: Updated %d tasks to 'dead' state.", shard, len(updatedTasks))
+        // Increment wait group counter
+        wg.Add(1)
+        
+        // Acquire semaphore slot (this will block if all slots are in use)
+        sem <- struct{}{}
+        
+        // Process shard in a separate goroutine
+        go func(shardName string) {
+            defer wg.Done()
+            defer func() { <-sem }() // Release semaphore when done
+            
+            // Create a child span for this shard
+            shardCtx, shardSpan := otel.Tracer("task-tracker").Start(ctx, fmt.Sprintf("process-shard-%s", shardName))
+            defer shardSpan.End()
+            
+            log.Printf("Processing shard: %s", shardName)
+            
+            // Update task statuses in this shard
+            updateQuery := fmt.Sprintf(`
+                UPDATE %s
+                SET status = 'dead'
+                WHERE 
+                    status = 'alive' 
+                    AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > interval
+                RETURNING id;`, shardName)
 
-		// Fetch all tasks and log their statuses
-		query := fmt.Sprintf(`
-			SELECT id, status, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, interval 
-			FROM %s;`, shard)
+            // Create DB span for update operation
+            dbUpdateCtx, dbUpdateSpan := otel.Tracer("task-tracker").Start(shardCtx, "update-tasks")
+            updateRows, err := db.Query(dbUpdateCtx, updateQuery)
+            dbUpdateSpan.End()
 
-		taskRows, err := db.Query(ctx, query)
-		if err != nil {
-			log.Printf("Error fetching task statuses from shard %s: %v", shard, err)
-			continue
-		}
-		defer taskRows.Close()
+            if err != nil {
+                dbUpdateSpan.RecordError(err)
+                log.Printf("Error updating tasks in shard %s: %v", shardName, err)
+                return
+            }
+            defer updateRows.Close()
 
-		for taskRows.Next() {
-			var taskID int
-			var status string
-			var timeDiff float64
-			var interval int
-			if err := taskRows.Scan(&taskID, &status, &timeDiff, &interval); err != nil {
-				log.Printf("Error scanning task row in shard %s: %v", shard, err)
-				continue
-			}
-			log.Printf("Shard %s - Task %d: Time since last ping: %.2f sec, Interval: %d sec, Status: %s",
-				shard, taskID, timeDiff, interval, status)
-		}
-	}
+            var updatedTasks []int
+            for updateRows.Next() {
+                var taskID int
+                if err := updateRows.Scan(&taskID); err != nil {
+                    log.Printf("Error scanning updated task ID in shard %s: %v", shardName, err)
+                    continue
+                }
+                updatedTasks = append(updatedTasks, taskID)
+            }
+
+            // Track updated tasks count
+            monitoringSummary.Lock()
+            monitoringSummary.UpdatedTasks += len(updatedTasks)
+            monitoringSummary.Unlock()
+
+            if len(updatedTasks) > 0 {
+                log.Printf("Shard %s: Updated %d tasks to 'dead' state: %v", shardName, len(updatedTasks), updatedTasks)
+            }
+
+            // Fetch all tasks and log their statuses with more detailed information
+            query := fmt.Sprintf(`
+                SELECT 
+                    id, 
+                    name,
+                    task_number,
+                    status, 
+                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, 
+                    interval,
+                    last_ping
+                FROM %s;`, shardName)
+
+            // Create DB span for fetch operation
+            dbFetchCtx, dbFetchSpan := otel.Tracer("task-tracker").Start(shardCtx, "fetch-tasks")
+            taskRows, err := db.Query(dbFetchCtx, query)
+            dbFetchSpan.End()
+
+            if err != nil {
+                dbFetchSpan.RecordError(err)
+                log.Printf("Error fetching task statuses from shard %s: %v", shardName, err)
+                return
+            }
+            defer taskRows.Close()
+
+            // Local counters for this shard
+            aliveCount := 0
+            deadCount := 0
+            warningCount := 0
+            
+            // Log output for this shard
+            fmt.Printf("\n===== SHARD %s STATUS REPORT =====\n", shardName)
+            fmt.Printf("%-5s | %-20s | %-10s | %-8s | %-15s | %-10s | %s\n", 
+                "ID", "Name", "Task#", "Status", "Last Ping", "Interval", "Time Since Ping")
+            fmt.Println(strings.Repeat("-", 95))
+
+            for taskRows.Next() {
+                var taskID int
+                var name string
+                var taskNumber int
+                var status string
+                var timeDiff float64
+                var interval int
+                var lastPing time.Time
+                
+                if err := taskRows.Scan(&taskID, &name, &taskNumber, &status, &timeDiff, &interval, &lastPing); err != nil {
+                    log.Printf("Error scanning task row in shard %s: %v", shardName, err)
+                    continue
+                }
+                
+                // Update counters
+                if status == "alive" {
+                    aliveCount++
+                } else {
+                    deadCount++
+                }
+                
+                // Check if task is approaching timeout (> 80% of interval passed)
+                isWarning := status == "alive" && timeDiff > float64(interval)*0.8
+                if isWarning {
+                    warningCount++
+                }
+                
+                // Print status with color coding for better visibility
+                statusDisplay := status
+                timeSinceStr := fmt.Sprintf("%.1f sec", timeDiff)
+                
+                // Output task status (always print status for visibility)
+                fmt.Printf("%-5d | %-20s | %-10d | %-8s | %-15s | %-10d | %s%s\n",
+                    taskID,
+                    truncateString(name, 20),
+                    taskNumber,
+                    statusDisplay,
+                    lastPing.Format("15:04:05"),
+                    interval,
+                    timeSinceStr,
+                    warningNote(isWarning, interval, timeDiff),
+                )
+            }
+            
+            fmt.Printf("\nSHARD SUMMARY: %d total tasks (%d alive, %d dead, %d warnings)\n", 
+                aliveCount+deadCount, aliveCount, deadCount, warningCount)
+            fmt.Println(strings.Repeat("=", 50))
+            
+            // Update global counters
+            monitoringSummary.Lock()
+            monitoringSummary.TotalTasks += (aliveCount + deadCount)
+            monitoringSummary.AliveTasks += aliveCount
+            monitoringSummary.DeadTasks += deadCount
+            monitoringSummary.WarningTasks += warningCount
+            monitoringSummary.Unlock()
+            
+            // Update last monitored timestamp
+            shardMutex.Lock()
+            shardMonitoringInfo[shardName] = &ShardInfo{
+                Name:          shardName,
+                LastMonitored: time.Now(),
+            }
+            shardMutex.Unlock()
+            
+            log.Printf("Finished processing shard: %s", shardName)
+        }(shard)
+    }
+    
+    // Wait for all goroutines to complete
+    wg.Wait()
+    
+    // Print overall summary
+    fmt.Printf("\n===== MONITORING SUMMARY =====\n")
+    fmt.Printf("Total Tasks: %d\n", monitoringSummary.TotalTasks)
+    fmt.Printf("Alive Tasks: %d\n", monitoringSummary.AliveTasks)
+    fmt.Printf("Dead Tasks: %d\n", monitoringSummary.DeadTasks)
+    fmt.Printf("Tasks Updated to Dead: %d\n", monitoringSummary.UpdatedTasks)
+    fmt.Printf("Warning Tasks (approaching timeout): %d\n", monitoringSummary.WarningTasks)
+    fmt.Println(strings.Repeat("=", 30))
+    
+    log.Println("Completed task status check for all shards")
+}
+
+// Helper functions for formatting output
+func truncateString(s string, maxLen int) string {
+    if len(s) <= maxLen {
+        return s
+    }
+    return s[:maxLen-3] + "..."
+}
+
+func warningNote(isWarning bool, interval int, timeDiff float64) string {
+    if !isWarning {
+        return ""
+    }
+    
+    percentRemaining := 100 - (timeDiff * 100 / float64(interval))
+    return fmt.Sprintf(" WARNING: %.1f%% time remaining", percentRemaining)
 }
 
 func startTaskMonitor() {
