@@ -371,72 +371,106 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
     respSpan.End() // Ends the response span
 }
 
+
 func checkTaskStatus() {
 	// Start an OpenTelemetry span
 	ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
-	startTime := time.Now() // Capture start time
-	
+	startTime := time.Now()
 	defer func() {
 		endTime := time.Now()
 		duration := endTime.Sub(startTime)
 		span.End()
 
-		// Print to stdout
+		// Print timing information
 		output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
 			startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
 		)
 		os.Stdout.WriteString(output)
 	}()
 
-	log.Println("Checking task statuses...")
+	log.Println("Fetching shards for task monitoring...")
 
-	// Query to update tasks
-	updateQuery := `
-		UPDATE tasks
-		SET status = 'dead'
-		WHERE 
-			status = 'alive' AND
-			EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > tasks.interval
-		RETURNING id;`
+	// Fetch shard names from Citus metadata
+	shardQuery := `SELECT shard_name FROM citus_shards WHERE table_name = (SELECT oid FROM pg_class WHERE relname = 'tasks');`
 
-	rows, err := db.Query(ctx, updateQuery)
+	shardRows, err := db.Query(ctx, shardQuery)
 	if err != nil {
-		log.Printf("Error updating task status: %v", err)
+		log.Fatalf("Error fetching shard names: %v", err)
+	}
+	defer shardRows.Close()
+
+	var shards []string
+	for shardRows.Next() {
+		var shardName string
+		if err := shardRows.Scan(&shardName); err != nil {
+			log.Fatalf("Error scanning shard name: %v", err)
+		}
+		shards = append(shards, shardName)
+	}
+
+	if len(shards) == 0 {
+		log.Println("No task shards found.")
 		return
 	}
-	defer rows.Close()
 
-	var updatedTasks []int
-	for rows.Next() {
-		var taskID int
-		if err := rows.Scan(&taskID); err != nil {
-			log.Printf("Error scanning row: %v", err)
+	log.Printf("Found %d shards: %v", len(shards), shards)
+
+	// Process each shard separately
+	for _, shard := range shards {
+		log.Printf("Processing shard: %s", shard)
+
+		// Update task statuses in this shard
+		updateQuery := fmt.Sprintf(`
+			UPDATE %s
+			SET status = 'dead'
+			WHERE 
+				status = 'alive' 
+				AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > interval
+			RETURNING id;`, shard)
+
+		updateRows, err := db.Query(ctx, updateQuery)
+		if err != nil {
+			log.Printf("Error updating tasks in shard %s: %v", shard, err)
 			continue
 		}
-		updatedTasks = append(updatedTasks, taskID)
-	}
+		defer updateRows.Close()
 
-	// Fetch all tasks with their statuses
-	query := `
-		SELECT id, status, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, interval FROM tasks;`
+		var updatedTasks []int
+		for updateRows.Next() {
+			var taskID int
+			if err := updateRows.Scan(&taskID); err != nil {
+				log.Printf("Error scanning updated task ID in shard %s: %v", shard, err)
+				continue
+			}
+			updatedTasks = append(updatedTasks, taskID)
+		}
 
-	rows, err = db.Query(ctx, query)
-	if err != nil {
-		log.Printf("Error fetching task statuses: %v", err)
-		return
-	}
-	defer rows.Close()
+		// log.Printf("Shard %s: Updated %d tasks to 'dead' state.", shard, len(updatedTasks))
 
-	for rows.Next() {
-		var taskID int
-		var status string
-		var timeDiff float64
-		var interval int
-		if err := rows.Scan(&taskID, &status, &timeDiff, &interval); err != nil {
-			log.Printf("Error scanning row: %v", err)
+		// Fetch all tasks and log their statuses
+		query := fmt.Sprintf(`
+			SELECT id, status, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, interval 
+			FROM %s;`, shard)
+
+		taskRows, err := db.Query(ctx, query)
+		if err != nil {
+			log.Printf("Error fetching task statuses from shard %s: %v", shard, err)
 			continue
 		}
-		log.Printf("Task %d - Time since last ping: %.2f seconds, Interval: %d seconds, Status: %s", taskID, timeDiff, interval, status)
+		defer taskRows.Close()
+
+		for taskRows.Next() {
+			var taskID int
+			var status string
+			var timeDiff float64
+			var interval int
+			if err := taskRows.Scan(&taskID, &status, &timeDiff, &interval); err != nil {
+				log.Printf("Error scanning task row in shard %s: %v", shard, err)
+				continue
+			}
+			log.Printf("Shard %s - Task %d: Time since last ping: %.2f sec, Interval: %d sec, Status: %s",
+				shard, taskID, timeDiff, interval, status)
+		}
 	}
 }
 
