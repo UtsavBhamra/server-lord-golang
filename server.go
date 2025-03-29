@@ -1,31 +1,33 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "os"
-    "log"
-    "net/http"
-    "strings"
-    "time"
-    "sync"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/gorilla/mux"
-    "github.com/jackc/pgx/v4/pgxpool"
-    "strconv"
+	"strconv"
+
+	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v4/pgxpool"
 
 	"go.opentelemetry.io/otel"
 	// "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
 
-    "github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt"
 	"github.com/rs/cors"
 	"golang.org/x/crypto/bcrypt"
 )
+
 type User struct {
 	ID       int    `json:"id"`
 	Username string `json:"username"`
@@ -44,20 +46,25 @@ type LoginResponse struct {
 }
 
 type Task struct {
-	ID         int64        `json:"id"`
-	Name       string     `json:"name"`
-	PingURL    string    `json:"ping_url"`
-	UserID     int64        `json:"user_id"`
-	LastPing   *time.Time `json:"last_ping"`
-	Interval   int        `json:"interval"`
-	TaskNumber int        `json:"task_number"`
-	Status     string     `json:"status"`
+	ID              int64      `json:"id"`
+	Name            string     `json:"name"`
+	PingURL         string     `json:"ping_url"`
+	UserID          int64      `json:"user_id"`
+	LastPing        *time.Time `json:"last_ping"`
+	Interval        int        `json:"interval"`
+	TaskNumber      int        `json:"task_number"`
+	Status          string     `json:"status"`
+	LastChecked     *time.Time `json:"last_checked"`
+	PreviousStatus  string     `json:"previous_status"`
+	UptimeSeconds   float64    `json:"uptime_seconds"`
+	DowntimeSeconds float64    `json:"downtime_seconds"`
 }
 
 // JWT secret key - In production, this should be stored securely
 var jwtSecret = []byte("server-lord-secret")
 
 var db *pgxpool.Pool
+
 type CustomSpanProcessor struct{}
 
 func (c *CustomSpanProcessor) OnStart(parent context.Context, span trace.ReadWriteSpan) {}
@@ -84,14 +91,14 @@ func (c *CustomSpanProcessor) OnEnd(span trace.ReadOnlySpan) {
 	os.Stdout.WriteString(output)
 }
 
-func (c *CustomSpanProcessor) Shutdown(ctx context.Context) error  { return nil }
+func (c *CustomSpanProcessor) Shutdown(ctx context.Context) error   { return nil }
 func (c *CustomSpanProcessor) ForceFlush(ctx context.Context) error { return nil }
 
 // Initialize OpenTelemetry with the custom span processor
 func initTracer() func() {
 	tp := trace.NewTracerProvider(
 		trace.WithSpanProcessor(&CustomSpanProcessor{}), // Use custom processor
-		trace.WithResource(resource.Empty()),           // No extra metadata
+		trace.WithResource(resource.Empty()),            // No extra metadata
 	)
 
 	otel.SetTracerProvider(tp)
@@ -105,24 +112,23 @@ func initTracer() func() {
 func RequestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
+
 		// Log the incoming request
 		log.Printf("➡️  %s %s [FROM: %s]", r.Method, r.URL.Path, r.RemoteAddr)
-		
+
 		// Call the next handler
 		next.ServeHTTP(w, r)
-		
+
 		// Log the time taken
 		duration := time.Since(start)
 		log.Printf("⏱️  %s %s completed in %v", r.Method, r.URL.Path, duration)
 	})
 }
 
-
 func main() {
-    // Initialize the tracer
-    shutdown := initTracer()
-    defer shutdown()
+	// Initialize the tracer
+	shutdown := initTracer()
+	defer shutdown()
 
 	// Database connection
 	dbURL := "postgres://postgres:postgres@localhost:5432/task_tracker"
@@ -149,31 +155,34 @@ func main() {
 
 	// Setup router
 	r := mux.NewRouter()
-    // Add request logger middleware
+	// Add request logger middleware
 	r.Use(RequestLogger)
 
-    r.Use(otelmux.Middleware("task-tracker"))
+	r.Use(otelmux.Middleware("task-tracker"))
 
-    // Authentication endpoint
+	// Authentication endpoint
 	r.HandleFunc("/api/login", loginHandler).Methods("POST", "OPTIONS")
-	
+
 	// User endpoints
 	r.HandleFunc("/api/users", createUser).Methods("POST", "OPTIONS")
 
-    // Process (task) endpoints - protected with JWT middleware
+	// Process (task) endpoints - protected with JWT middleware
 	r.HandleFunc("/api/tasks", JWTMiddleware(createTask)).Methods("POST", "OPTIONS")
 	r.HandleFunc("/api/tasks/{id}", JWTMiddleware(getTask)).Methods("GET", "OPTIONS")
 	r.HandleFunc("/api/users/{user_id}/tasks", JWTMiddleware(getUserTasks)).Methods("GET", "OPTIONS")
 	r.HandleFunc("/api/tasks/{id}", JWTMiddleware(deleteTask)).Methods("DELETE", "OPTIONS")
 	r.HandleFunc("/api/tasks/{id}", JWTMiddleware(updateTask)).Methods("PUT", "OPTIONS")
 
-    // old routes
+	// old routes
 	// r.HandleFunc("/register", registerHandler).Methods("POST")
 	// r.HandleFunc("/tasks", createTaskHandler).Methods("POST")
 	// r.HandleFunc("/users/{userId}", getUserHandler).Methods("GET")
 	r.HandleFunc("/tasks/{taskId}/heartbeat", heartbeatHandler).Methods("POST")
 
-    // Setup CORS
+	// Stats route
+	r.HandleFunc("/api/tasks/{id}/metrics", JWTMiddleware(getTaskMetrics)).Methods("GET", "OPTIONS")
+
+	// Setup CORS
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"}, // Allow all origins - more permissive for development
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -188,9 +197,9 @@ func main() {
 	// Start server
 	port := os.Getenv("PORT")
 	if port == "" {
-		port ="3000"
+		port = "3000"
 	}
-	
+
 	log.Printf("🚀 Server starting on port %s with CORS enabled...\n", port)
 	log.Printf("📌 API endpoints available at http://localhost:%s/api\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
@@ -212,7 +221,7 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	w.Write(response)
-	
+
 	if code >= 200 && code < 300 {
 		log.Printf("✅ Success response [%d]", code)
 	}
@@ -228,15 +237,19 @@ func initDB(db *pgxpool.Pool) error {
             password TEXT NOT NULL
         );`,
 		`CREATE TABLE IF NOT EXISTS tasks (
-			id SERIAL PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			ping_url VARCHAR(255),
-			user_id INTEGER REFERENCES users(id),
-			last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			interval INTEGER NOT NULL,
-			task_number INTEGER NOT NULL,
-			status VARCHAR(50) DEFAULT 'alive'
-		)`,
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            ping_url VARCHAR(255),
+            user_id INTEGER REFERENCES users(id),
+            last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            interval INTEGER NOT NULL,
+            task_number INTEGER NOT NULL,
+            status VARCHAR(50) DEFAULT 'alive',
+            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            previous_status VARCHAR(50) DEFAULT 'alive',
+            uptime_seconds FLOAT DEFAULT 0,
+            downtime_seconds FLOAT DEFAULT 0
+        )`,
 	}
 
 	for _, query := range queries {
@@ -246,13 +259,14 @@ func initDB(db *pgxpool.Pool) error {
 		}
 	}
 
+	log.Println("✅ Database schema initialized successfully")
 	return nil
 }
 
 // Authentication handlers
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("📝 Processing login request")
-	
+
 	var loginReq LoginRequest
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&loginReq); err != nil {
@@ -265,22 +279,22 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	// Get user from database
 	var user User
 	var hashedPassword string
-	
+
 	err := db.QueryRow(
 		context.Background(),
 		"SELECT id, username, email, password FROM users WHERE email = $1",
 		loginReq.Email).Scan(&user.ID, &user.Username, &user.Email, &hashedPassword)
-	
-		if err != nil {
-			if err.Error() == "no rows in result set" {
-                log.Printf("❌ User with email %s not found", loginReq.Email)
-                respondWithError(w, http.StatusUnauthorized, "Invalid credentials")
-                return
-            }
-            log.Printf("❌ Error retrieving user: %v", err)
-            respondWithError(w, http.StatusInternalServerError, "Error retrieving user")
-            return
-        }
+
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			log.Printf("❌ User with email %s not found", loginReq.Email)
+			respondWithError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+		log.Printf("❌ Error retrieving user: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Error retrieving user")
+		return
+	}
 
 	// Compare passwords
 	err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(loginReq.Password))
@@ -316,7 +330,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 func generateToken(user User) (string, error) {
 	// Set token expiration to 24 hours
 	expirationTime := time.Now().Add(24 * time.Hour)
-	
+
 	// Create the JWT claims
 	claims := jwt.MapClaims{
 		"id":       user.ID,
@@ -328,7 +342,7 @@ func generateToken(user User) (string, error) {
 
 	// Create token with claims
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	
+
 	// Sign the token with our secret
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
@@ -386,13 +400,13 @@ func JWTMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // User handlers
 func createUser(w http.ResponseWriter, r *http.Request) {
 	log.Println("📝 Processing create user request")
-	
+
 	var user struct {
 		Username string `json:"username"`
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-	
+
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&user); err != nil {
 		log.Printf("❌ Invalid request payload: %v", err)
@@ -402,7 +416,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	log.Printf("👤 Creating user: %s (%s)", user.Username, user.Email)
-	
+
 	// Hash the password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -410,14 +424,14 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusInternalServerError, "Error processing user data")
 		return
 	}
-	
+
 	// Insert user into database with hashed password
 	var userID int
 	err = db.QueryRow(
 		context.Background(),
 		"INSERT INTO users(username, email, password) VALUES($1, $2, $3) RETURNING id",
 		user.Username, user.Email, string(hashedPassword)).Scan(&userID)
-	
+
 	if err != nil {
 		log.Printf("❌ Error creating user: %v", err)
 		respondWithError(w, http.StatusInternalServerError, "Error creating user")
@@ -438,7 +452,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 // Task handlers
 func createTask(w http.ResponseWriter, r *http.Request) {
 	log.Println("📝 Processing create task request")
-	
+
 	var task Task
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&task); err != nil {
@@ -449,7 +463,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	log.Printf("📋 Creating task: %s for user ID: %d", task.Name, task.UserID)
-	
+
 	// Validate user exists
 	var exists bool
 	err := db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", task.UserID).Scan(&exists)
@@ -465,7 +479,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		`INSERT INTO tasks(name, ping_url, user_id, interval, task_number, status) 
 		VALUES($1, $2, $3, $4, $5, $6) RETURNING id`,
 		task.Name, task.PingURL, task.UserID, task.Interval, task.TaskNumber, "alive").Scan(&task.ID)
-	
+
 	if err != nil {
 		log.Printf("❌ Error creating task: %v", err)
 		respondWithError(w, http.StatusInternalServerError, "Error creating task")
@@ -481,20 +495,19 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 	log.Printf("✅ Task created successfully with ID: %d", task.ID)
 	respondWithJSON(w, http.StatusCreated, task)
 }
-
 func getTask(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id, err := strconv.ParseInt(vars["id"], 10, 64)
-	if err != nil {
-		log.Printf("❌ Invalid task ID: %s", vars["id"])
-		respondWithError(w, http.StatusBadRequest, "Invalid task ID")
-		return
-	}
+    vars := mux.Vars(r)
+    id, err := strconv.ParseInt(vars["id"], 10, 64)
+    if err != nil {
+        log.Printf("❌ Invalid task ID: %s", vars["id"])
+        respondWithError(w, http.StatusBadRequest, "Invalid task ID")
+        return
+    }
 
-	log.Printf("🔍 Fetching task with ID: %d", id)
-	
-	task, err := getTaskByID(id)
-	if err != nil {
+    log.Printf("🔍 Fetching task with ID: %d", id)
+
+    task, err := getTaskByID(id)
+    if err != nil {
         if strings.Contains(err.Error(), "no rows") {
             log.Printf("❌ Task not found with ID: %d", id)
             respondWithError(w, http.StatusNotFound, "Task not found")
@@ -504,48 +517,129 @@ func getTask(w http.ResponseWriter, r *http.Request) {
         }
         return
     }
+    
+    // Calculate uptime percentage for enhanced task info
+    totalTime := task.UptimeSeconds + task.DowntimeSeconds
+    var uptimePercentage float64 = 0
+    if totalTime > 0 {
+        uptimePercentage = (task.UptimeSeconds / totalTime) * 100
+    }
+    
+    // Create enhanced response with metrics included
+    enhancedTask := struct {
+        Task             Task    `json:"task"`
+        Metrics          struct {
+            UptimePercentage float64 `json:"uptime_percentage"`
+            LastChecked      string  `json:"last_checked,omitempty"`
+        } `json:"metrics"`
+    }{
+        Task: task,
+        Metrics: struct {
+            UptimePercentage float64 `json:"uptime_percentage"`
+            LastChecked      string  `json:"last_checked,omitempty"`
+        }{
+            UptimePercentage: uptimePercentage,
+        },
+    }
+    
+    // Add LastChecked if available
+    if task.LastChecked != nil {
+        enhancedTask.Metrics.LastChecked = task.LastChecked.Format(time.RFC3339)
+    }
 
-	log.Printf("✅ Task fetched successfully: %s (ID: %d)", task.Name, task.ID)
-	respondWithJSON(w, http.StatusOK, task)
+    log.Printf("✅ Task fetched successfully: %s (ID: %d)", task.Name, task.ID)
+    respondWithJSON(w, http.StatusOK, enhancedTask)
 }
 
 func getUserTasks(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	userID, err := strconv.Atoi(vars["user_id"])
-	if err != nil {
-		log.Printf("❌ Invalid user ID: %s", vars["user_id"])
-		respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
+    vars := mux.Vars(r)
+    userID, err := strconv.Atoi(vars["user_id"])
+    if err != nil {
+        log.Printf("❌ Invalid user ID: %s", vars["user_id"])
+        respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+        return
+    }
 
-	log.Printf("🔍 Fetching tasks for user ID: %d", userID)
-	
-	rows, err := db.Query(context.Background(), "SELECT id, name, ping_url, user_id, last_ping, interval, task_number, status FROM tasks WHERE user_id = $1", userID)
-	if err != nil {
-		log.Printf("❌ Error querying tasks: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Error retrieving tasks")
-		return
-	}
-	defer rows.Close()
+    log.Printf("🔍 Fetching tasks for user ID: %d", userID)
 
-	tasks := []Task{}
-	for rows.Next() {
-		var task Task
-		if err := rows.Scan(&task.ID, &task.Name, &task.PingURL, &task.UserID, &task.LastPing, &task.Interval, &task.TaskNumber, &task.Status); err != nil {
-			log.Printf("❌ Error scanning task: %v", err)
-			continue
-		}
-		tasks = append(tasks, task)
-	}
+    // Updated query to include metric fields
+    rows, err := db.Query(context.Background(), `
+        SELECT 
+            id, name, ping_url, user_id, last_ping, interval, task_number, status,
+            last_checked, previous_status, uptime_seconds, downtime_seconds
+        FROM tasks 
+        WHERE user_id = $1`, userID)
+    
+    if err != nil {
+        log.Printf("❌ Error querying tasks: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error retrieving tasks")
+        return
+    }
+    defer rows.Close()
 
-	if err = rows.Err(); err != nil {
-		log.Printf("❌ Error iterating tasks: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Error retrieving tasks")
-		return
-	}
+    type EnhancedTask struct {
+        Task             Task    `json:"task"`
+        Metrics          struct {
+            UptimePercentage float64 `json:"uptime_percentage"`
+            LastChecked      string  `json:"last_checked,omitempty"`
+        } `json:"metrics"`
+    }
 
-	log.Printf("✅ Retrieved %d tasks for user ID: %d", len(tasks), userID)
-	respondWithJSON(w, http.StatusOK, tasks)
+    enhancedTasks := []EnhancedTask{}
+    
+    for rows.Next() {
+        var task Task
+        if err := rows.Scan(
+            &task.ID, 
+            &task.Name, 
+            &task.PingURL, 
+            &task.UserID, 
+            &task.LastPing, 
+            &task.Interval, 
+            &task.TaskNumber, 
+            &task.Status,
+            &task.LastChecked,
+            &task.PreviousStatus,
+            &task.UptimeSeconds,
+            &task.DowntimeSeconds,
+        ); err != nil {
+            log.Printf("❌ Error scanning task: %v", err)
+            continue
+        }
+        
+        // Calculate uptime percentage
+        totalTime := task.UptimeSeconds + task.DowntimeSeconds
+        var uptimePercentage float64 = 0
+        if totalTime > 0 {
+            uptimePercentage = (task.UptimeSeconds / totalTime) * 100
+        }
+        
+        enhancedTask := EnhancedTask{
+            Task: task,
+            Metrics: struct {
+                UptimePercentage float64 `json:"uptime_percentage"`
+                LastChecked      string  `json:"last_checked,omitempty"`
+            }{
+                UptimePercentage: uptimePercentage,
+            },
+        }
+        
+        // Add LastChecked if available
+        if task.LastChecked != nil {
+            enhancedTask.Metrics.LastChecked = task.LastChecked.Format(time.RFC3339)
+        }
+        
+        enhancedTasks = append(enhancedTasks, enhancedTask)
+    }
+
+    if err = rows.Err(); err != nil {
+        log.Printf("❌ Error iterating tasks: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error retrieving tasks")
+        return
+    }
+
+    log.Printf("✅ Retrieved %d tasks for user ID: %d", len(enhancedTasks), userID)
+    respondWithJSON(w, http.StatusOK, enhancedTasks)
 }
 
 func deleteTask(w http.ResponseWriter, r *http.Request) {
@@ -558,7 +652,7 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("🗑️ Deleting task with ID: %d", id)
-	
+
 	result, err := db.Exec(context.Background(), "DELETE FROM tasks WHERE id = $1", id)
 	if err != nil {
 		log.Printf("❌ Error deleting task: %v", err)
@@ -584,24 +678,24 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateTask(w http.ResponseWriter, r *http.Request) {
-    vars := mux.Vars(r)
-    id, err := strconv.ParseInt(vars["id"], 10, 64)
-    if err != nil {
-        log.Printf("❌ Invalid task ID: %s", vars["id"])
-        respondWithError(w, http.StatusBadRequest, "Invalid task ID")
-        return
-    }
+	vars := mux.Vars(r)
+	id, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		log.Printf("❌ Invalid task ID: %s", vars["id"])
+		respondWithError(w, http.StatusBadRequest, "Invalid task ID")
+		return
+	}
 
-    log.Printf("✏️ Updating task with ID: %d", id)
-    
-    var task Task
-    decoder := json.NewDecoder(r.Body)
-    if err := decoder.Decode(&task); err != nil {
-        log.Printf("❌ Invalid request payload: %v", err)
-        respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-        return
-    }
-    defer r.Body.Close()
+	log.Printf("✏️ Updating task with ID: %d", id)
+
+	var task Task
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&task); err != nil {
+		log.Printf("❌ Invalid request payload: %v", err)
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+	defer r.Body.Close()
 
 	// First check if task exists
 	_, err = getTaskByID(id)
@@ -616,29 +710,29 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-    // Update task
-    _, err = db.Exec(
-        context.Background(),
-        `UPDATE tasks SET name = $1, ping_url = $2, interval = $3, 
+	// Update task
+	_, err = db.Exec(
+		context.Background(),
+		`UPDATE tasks SET name = $1, ping_url = $2, interval = $3, 
         task_number = $4, status = $5 WHERE id = $6`,
-        task.Name, task.PingURL, task.Interval, task.TaskNumber, task.Status, id)	
-    
-    if err != nil {
-        log.Printf("❌ Error updating task: %v", err)
-        respondWithError(w, http.StatusInternalServerError, "Error updating task")
-        return
-    }
+		task.Name, task.PingURL, task.Interval, task.TaskNumber, task.Status, id)
 
-    // Fetch updated task
-    updatedTask, err := getTaskByID(id)
-    if err != nil {
-        log.Printf("❌ Error fetching updated task: %v", err)
-        respondWithError(w, http.StatusInternalServerError, "Task updated but error retrieving updated data")
-        return
-    }
+	if err != nil {
+		log.Printf("❌ Error updating task: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Error updating task")
+		return
+	}
 
-    log.Printf("✅ Task updated successfully: %s (ID: %d)", updatedTask.Name, updatedTask.ID)
-    respondWithJSON(w, http.StatusOK, updatedTask)
+	// Fetch updated task
+	updatedTask, err := getTaskByID(id)
+	if err != nil {
+		log.Printf("❌ Error fetching updated task: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Task updated but error retrieving updated data")
+		return
+	}
+
+	log.Printf("✅ Task updated successfully: %s (ID: %d)", updatedTask.Name, updatedTask.ID)
+	respondWithJSON(w, http.StatusOK, updatedTask)
 }
 
 // Helper function to get a task by ID
@@ -646,16 +740,30 @@ func getTaskByID(id int64) (Task, error) {
 	var task Task
 	err := db.QueryRow(
 		context.Background(),
-		"SELECT id, name, ping_url, user_id, last_ping, interval, task_number, status FROM tasks WHERE id = $1", 
-		id).Scan(&task.ID, &task.Name, &task.PingURL, &task.UserID, &task.LastPing, &task.Interval, &task.TaskNumber, &task.Status)
+		`SELECT id, name, ping_url, user_id, last_ping, interval, task_number, status,
+         last_checked, previous_status, uptime_seconds, downtime_seconds
+         FROM tasks WHERE id = $1`,
+		id).Scan(
+		&task.ID,
+		&task.Name,
+		&task.PingURL,
+		&task.UserID,
+		&task.LastPing,
+		&task.Interval,
+		&task.TaskNumber,
+		&task.Status,
+		&task.LastChecked,
+		&task.PreviousStatus,
+		&task.UptimeSeconds,
+		&task.DowntimeSeconds,
+	)
 
 	if err != nil {
 		return task, err
 	}
-	
+
 	return task, nil
 }
-
 
 // // old user and task creation handlers
 // func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -689,7 +797,6 @@ func getTaskByID(id int64) (Task, error) {
 //         attribute.String("user", user.Username),
 //     )
 
-	
 // 	// Response time measurement
 // 	_, respSpan := otel.Tracer("task-tracker").Start(ctx, "sendResponse")
 // 	w.Header().Set("Content-Type", "application/json")
@@ -762,8 +869,8 @@ func getTaskByID(id int64) (Task, error) {
 //     }
 
 //     // Insert into database
-//     query := `INSERT INTO tasks (name, ping_url, user_id, interval, task_number, status) 
-//               VALUES ($1, $2, $3, $4, $5, 'alive') 
+//     query := `INSERT INTO tasks (name, ping_url, user_id, interval, task_number, status)
+//               VALUES ($1, $2, $3, $4, $5, 'alive')
 //               RETURNING id, last_ping`
 
 //     err = db.QueryRow(context.Background(), query, task.Name, task.PingURL, task.UserID, task.Interval, task.TaskNumber).Scan(&task.ID, &task.LastPing)
@@ -780,7 +887,6 @@ func getTaskByID(id int64) (Task, error) {
 //     json.NewEncoder(w).Encode(task)
 // }
 
-
 // func getUserHandler(w http.ResponseWriter, r *http.Request) {
 // 	vars := mux.Vars(r)
 // 	userID := vars["userId"]
@@ -794,7 +900,7 @@ func getTaskByID(id int64) (Task, error) {
 // 	}
 
 // 	// Get user's tasks
-// 	tasksQuery := `SELECT id, name, ping_url, last_ping, interval, task_number, status 
+// 	tasksQuery := `SELECT id, name, ping_url, last_ping, interval, task_number, status
 // 		FROM tasks WHERE user_id = $1`
 // 	rows, err := db.Query(context.Background(), tasksQuery, userID)
 // 	if err != nil {
@@ -834,9 +940,11 @@ func getTaskByID(id int64) (Task, error) {
 // 	json.NewEncoder(w).Encode(response)
 // }
 
+
+// function to handle heartbeats
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
-    ctx, span := otel.Tracer("task-tracker").Start(r.Context(), "heartbeatHandler")
-    defer span.End()
+	ctx, span := otel.Tracer("task-tracker").Start(r.Context(), "heartbeatHandler")
+	defer span.End()
 
 	vars := mux.Vars(r)
 	taskID := vars["taskId"]
@@ -849,36 +957,36 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 	var id int64
 
-    // Instrument database query
-    dbCtx, dbSpan := otel.Tracer("task-tracker").Start(ctx, "dbQuery")
-	err := db.QueryRow(dbCtx, query, taskID).Scan(&id)  //Execute the db query
-    dbSpan.End() // Ends the database query span
+	// Instrument database query
+	dbCtx, dbSpan := otel.Tracer("task-tracker").Start(ctx, "dbQuery")
+	err := db.QueryRow(dbCtx, query, taskID).Scan(&id) //Execute the db query
+	dbSpan.End()                                       // Ends the database query span
 
-    //Error handling
+	//Error handling
 	if err != nil {
-        dbSpan.RecordError(err)
+		dbSpan.RecordError(err)
 		http.Error(w, "Task not found", http.StatusNotFound)
 		return
 	}
 
-    // Add attributes to DB span
-    dbSpan.SetAttributes(
-        attribute.String("query", query),
-        attribute.String("taskID", taskID),
-    )
+	// Add attributes to DB span
+	dbSpan.SetAttributes(
+		attribute.String("query", query),
+		attribute.String("taskID", taskID),
+	)
 
-    // Instrument response writing
-    _, respSpan := otel.Tracer("task-tracker").Start(ctx, "sendResponse")
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{"message": "Heartbeat received"})
-    respSpan.End() // Ends the response span
+	// Instrument response writing
+	_, respSpan := otel.Tracer("task-tracker").Start(ctx, "sendResponse")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Heartbeat received"})
+	respSpan.End() // Ends the response span
 }
 
 // taskmonitoring function
 // ShardInfo tracks monitoring information about shards
 type ShardInfo struct {
-    Name          string
-    LastMonitored time.Time
+	Name          string
+	LastMonitored time.Time
 }
 
 // Global map to track when each shard was last monitored
@@ -886,139 +994,99 @@ var shardMonitoringInfo = make(map[string]*ShardInfo)
 var shardMutex sync.RWMutex
 
 func checkTaskStatus() {
-    // Start an OpenTelemetry span
-    ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
-    startTime := time.Now()
-    defer func() {
-        endTime := time.Now()
-        duration := endTime.Sub(startTime)
-        span.End()
+	// Start an OpenTelemetry span
+	ctx, span := otel.Tracer("task-tracker").Start(context.Background(), "checkTaskStatus")
+	startTime := time.Now()
+	defer func() {
+		endTime := time.Now()
+		duration := endTime.Sub(startTime)
+		span.End()
 
-        // Print timing information
-        output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
-            startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
-        )
-        os.Stdout.WriteString(output)
-    }()
+		// Print timing information
+		output := fmt.Sprintf("Route: checkTaskStatus | Start: %s | End: %s | Duration: %dms\n",
+			startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano), duration.Milliseconds(),
+		)
+		os.Stdout.WriteString(output)
+	}()
 
-    log.Println("Fetching shards for task monitoring...")
+	log.Println("Fetching shards for task monitoring...")
 
-    // Fetch shard names from Citus metadata
-    shardQuery := `SELECT shard_name FROM citus_shards WHERE table_name = (SELECT oid FROM pg_class WHERE relname = 'tasks');`
+	// Fetch shard names from Citus metadata
+	shardQuery := `SELECT shard_name FROM citus_shards WHERE table_name = (SELECT oid FROM pg_class WHERE relname = 'tasks');`
 
-    shardRows, err := db.Query(ctx, shardQuery)
-    if err != nil {
-        log.Printf("Error fetching shard names: %v", err)
-        return
-    }
-    defer shardRows.Close()
+	shardRows, err := db.Query(ctx, shardQuery)
+	if err != nil {
+		log.Printf("Error fetching shard names: %v", err)
+		return
+	}
+	defer shardRows.Close()
 
-    var shards []string
-    for shardRows.Next() {
-        var shardName string
-        if err := shardRows.Scan(&shardName); err != nil {
-            log.Printf("Error scanning shard name: %v", err)
-            continue
-        }
-        shards = append(shards, shardName)
-    }
+	var shards []string
+	for shardRows.Next() {
+		var shardName string
+		if err := shardRows.Scan(&shardName); err != nil {
+			log.Printf("Error scanning shard name: %v", err)
+			continue
+		}
+		shards = append(shards, shardName)
+	}
 
-    if len(shards) == 0 {
-        log.Println("No task shards found.")
-        return
-    }
+	if len(shards) == 0 {
+		log.Println("No task shards found.")
+		return
+	}
 
-    log.Printf("Found %d shards: %v", len(shards), shards)
+	log.Printf("Found %d shards: %v", len(shards), shards)
 
-    // Create a semaphore with fixed capacity
-    maxConcurrentShards := 3
-    sem := make(chan struct{}, maxConcurrentShards)
-    
-    // Create a wait group to wait for all goroutines to finish
-    var wg sync.WaitGroup
+	// Create a semaphore with fixed capacity
+	maxConcurrentShards := 3
+	sem := make(chan struct{}, maxConcurrentShards)
 
-    // Track monitoring stats
-    var monitoringSummary struct {
-        sync.Mutex
-        TotalTasks     int
-        AliveTasks     int
-        DeadTasks      int
-        UpdatedTasks   int
-        WarningTasks   int  // Tasks approaching their timeout
-    }
+	// Create a wait group to wait for all goroutines to finish
+	var wg sync.WaitGroup
 
-    // Process each shard
-    for _, shard := range shards {
-        // Check if this shard needs monitoring
-        shardMutex.RLock()
-        info, exists := shardMonitoringInfo[shard]
-        needsMonitoring := !exists || time.Since(info.LastMonitored) > 15*time.Second
-        shardMutex.RUnlock()
+	// Track monitoring stats
+	var monitoringSummary struct {
+		sync.Mutex
+		TotalTasks   int
+		AliveTasks   int
+		DeadTasks    int
+		UpdatedTasks int
+		WarningTasks int // Tasks approaching their timeout
+	}
 
-        if !needsMonitoring {
-            log.Printf("Skipping shard %s - recently monitored at %v", shard, info.LastMonitored)
-            continue
-        }
+	// Process each shard
+	for _, shard := range shards {
+		// Check if this shard needs monitoring
+		shardMutex.RLock()
+		info, exists := shardMonitoringInfo[shard]
+		needsMonitoring := !exists || time.Since(info.LastMonitored) > 15*time.Second
+		shardMutex.RUnlock()
 
-        // Increment wait group counter
-        wg.Add(1)
-        
-        // Acquire semaphore slot (this will block if all slots are in use)
-        sem <- struct{}{}
-        
-        // Process shard in a separate goroutine
-        go func(shardName string) {
-            defer wg.Done()
-            defer func() { <-sem }() // Release semaphore when done
-            
-            // Create a child span for this shard
-            shardCtx, shardSpan := otel.Tracer("task-tracker").Start(ctx, fmt.Sprintf("process-shard-%s", shardName))
-            defer shardSpan.End()
-            
-            log.Printf("Processing shard: %s", shardName)
-            
-            // Update task statuses in this shard
-            updateQuery := fmt.Sprintf(`
-                UPDATE %s
-                SET status = 'dead'
-                WHERE 
-                    status = 'alive' 
-                    AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) > interval
-                RETURNING id;`, shardName)
+		if !needsMonitoring {
+			log.Printf("Skipping shard %s - recently monitored at %v", shard, info.LastMonitored)
+			continue
+		}
 
-            // Create DB span for update operation
-            dbUpdateCtx, dbUpdateSpan := otel.Tracer("task-tracker").Start(shardCtx, "update-tasks")
-            updateRows, err := db.Query(dbUpdateCtx, updateQuery)
-            dbUpdateSpan.End()
+		// Increment wait group counter
+		wg.Add(1)
 
-            if err != nil {
-                dbUpdateSpan.RecordError(err)
-                log.Printf("Error updating tasks in shard %s: %v", shardName, err)
-                return
-            }
-            defer updateRows.Close()
+		// Acquire semaphore slot (this will block if all slots are in use)
+		sem <- struct{}{}
 
-            var updatedTasks []int
-            for updateRows.Next() {
-                var taskID int
-                if err := updateRows.Scan(&taskID); err != nil {
-                    log.Printf("Error scanning updated task ID in shard %s: %v", shardName, err)
-                    continue
-                }
-                updatedTasks = append(updatedTasks, taskID)
-            }
+		// Process shard in a separate goroutine
+		go func(shardName string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore when done
 
-            // Track updated tasks count
-            monitoringSummary.Lock()
-            monitoringSummary.UpdatedTasks += len(updatedTasks)
-            monitoringSummary.Unlock()
+			// Create a child span for this shard
+			shardCtx, shardSpan := otel.Tracer("task-tracker").Start(ctx, fmt.Sprintf("process-shard-%s", shardName))
+			defer shardSpan.End()
 
-            if len(updatedTasks) > 0 {
-                log.Printf("Shard %s: Updated %d tasks to 'dead' state: %v", shardName, len(updatedTasks), updatedTasks)
-            }
+			log.Printf("Processing shard: %s", shardName)
 
-            // Fetch all tasks and log their statuses with more detailed information
-            query := fmt.Sprintf(`
+			// First fetch all tasks to check their current status and update metrics
+			fetchQuery := fmt.Sprintf(`
                 SELECT 
                     id, 
                     name,
@@ -1026,138 +1094,228 @@ func checkTaskStatus() {
                     status, 
                     EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_ping)) AS time_diff, 
                     interval,
-                    last_ping
+                    last_ping,
+                    last_checked,
+                    previous_status,
+                    uptime_seconds,
+                    downtime_seconds
                 FROM %s;`, shardName)
 
-            // Create DB span for fetch operation
-            dbFetchCtx, dbFetchSpan := otel.Tracer("task-tracker").Start(shardCtx, "fetch-tasks")
-            taskRows, err := db.Query(dbFetchCtx, query)
-            dbFetchSpan.End()
+			// Create DB span for fetch operation
+			dbFetchCtx, dbFetchSpan := otel.Tracer("task-tracker").Start(shardCtx, "fetch-tasks")
+			taskRows, err := db.Query(dbFetchCtx, fetchQuery)
+			dbFetchSpan.End()
 
-            if err != nil {
-                dbFetchSpan.RecordError(err)
-                log.Printf("Error fetching task statuses from shard %s: %v", shardName, err)
-                return
-            }
-            defer taskRows.Close()
+			if err != nil {
+				dbFetchSpan.RecordError(err)
+				log.Printf("Error fetching task statuses from shard %s: %v", shardName, err)
+				return
+			}
+			defer taskRows.Close()
 
-            // Local counters for this shard
-            aliveCount := 0
-            deadCount := 0
-            warningCount := 0
-            
-            // Log output for this shard
-            fmt.Printf("\n===== SHARD %s STATUS REPORT =====\n", shardName)
-            fmt.Printf("%-5s | %-20s | %-10s | %-8s | %-15s | %-10s | %s\n", 
-                "ID", "Name", "Task#", "Status", "Last Ping", "Interval", "Time Since Ping")
-            fmt.Println(strings.Repeat("-", 95))
+			currentTime := time.Now()
+			var updatedTaskIDs []int
+			var deadTasks []int
 
-            for taskRows.Next() {
-                var taskID int
-                var name string
-                var taskNumber int
-                var status string
-                var timeDiff float64
-                var interval int
-                var lastPing time.Time
-                
-                if err := taskRows.Scan(&taskID, &name, &taskNumber, &status, &timeDiff, &interval, &lastPing); err != nil {
-                    log.Printf("Error scanning task row in shard %s: %v", shardName, err)
-                    continue
-                }
-                
-                // Update counters
-                if status == "alive" {
-                    aliveCount++
+			// Local counters for this shard
+			aliveCount := 0
+			deadCount := 0
+			warningCount := 0
+
+			// Log output for this shard
+			fmt.Printf("\n===== SHARD %s STATUS REPORT =====\n", shardName)
+			fmt.Printf("%-5s | %-20s | %-10s | %-8s | %-15s | %-10s | %-15s | %-15s\n",
+				"ID", "Name", "Task#", "Status", "Last Ping", "Interval", "Uptime (sec)", "Downtime (sec)")
+			fmt.Println(strings.Repeat("-", 110))
+
+			// Process each task and calculate new uptime/downtime
+			for taskRows.Next() {
+				var (
+					taskID          int
+					name            string
+					taskNumber      int
+					status          string
+					timeDiff        float64
+					interval        int
+					lastPing        time.Time
+					lastChecked     *time.Time
+					previousStatus  string
+					uptimeSeconds   float64
+					downtimeSeconds float64
+				)
+
+				if err := taskRows.Scan(
+					&taskID,
+					&name,
+					&taskNumber,
+					&status,
+					&timeDiff,
+					&interval,
+					&lastPing,
+					&lastChecked,
+					&previousStatus,
+					&uptimeSeconds,
+					&downtimeSeconds,
+				); err != nil {
+					log.Printf("Error scanning task row in shard %s: %v", shardName, err)
+					continue
+				}
+
+				// Determine if the task should be marked as dead
+				newStatus := status
+				if status == "alive" && timeDiff > float64(interval) {
+					newStatus = "dead"
+					deadTasks = append(deadTasks, taskID)
+				}
+
+				// Update uptime/downtime based on status transitions
+				newUptimeSeconds := uptimeSeconds
+				newDowntimeSeconds := downtimeSeconds
+
+				// Calculate time since last check (or last ping if no previous checks)
+				// Ensure both timestamps are in UTC before subtraction
+                var timeSinceLastCheck float64
+                if lastChecked != nil {
+                    currentTimeUTC := currentTime.UTC()
+                    lastCheckedUTC := lastChecked.UTC() // Convert lastChecked to UTC
+
+                    // Calculate the time difference in seconds
+                    timeSinceLastCheck = currentTimeUTC.Sub(lastCheckedUTC).Seconds()
+
+                    // Debug logging
+                    log.Printf("Debug: currentTime=%v (UTC=%v), lastChecked=%v (UTC=%v), diff=%v",
+                        currentTime, currentTimeUTC, *lastChecked, lastCheckedUTC, timeSinceLastCheck)
                 } else {
-                    deadCount++
+                    timeSinceLastCheck = 0
                 }
-                
-                // Check if task is approaching timeout (> 80% of interval passed)
-                isWarning := status == "alive" && timeDiff > float64(interval)*0.8
-                if isWarning {
-                    warningCount++
-                }
-                
-                // Print status with color coding for better visibility
-                statusDisplay := status
-                timeSinceStr := fmt.Sprintf("%.1f sec", timeDiff)
-                
-                // Output task status (always print status for visibility)
-                fmt.Printf("%-5d | %-20s | %-10d | %-8s | %-15s | %-10d | %s%s\n",
-                    taskID,
-                    truncateString(name, 20),
-                    taskNumber,
-                    statusDisplay,
-                    lastPing.Format("15:04:05"),
-                    interval,
-                    timeSinceStr,
-                    warningNote(isWarning, interval, timeDiff),
-                )
-            }
-            
-            fmt.Printf("\nSHARD SUMMARY: %d total tasks (%d alive, %d dead, %d warnings)\n", 
-                aliveCount+deadCount, aliveCount, deadCount, warningCount)
-            fmt.Println(strings.Repeat("=", 50))
-            
-            // Update global counters
-            monitoringSummary.Lock()
-            monitoringSummary.TotalTasks += (aliveCount + deadCount)
-            monitoringSummary.AliveTasks += aliveCount
-            monitoringSummary.DeadTasks += deadCount
-            monitoringSummary.WarningTasks += warningCount
-            monitoringSummary.Unlock()
-            
-            // Update last monitored timestamp
-            shardMutex.Lock()
-            shardMonitoringInfo[shardName] = &ShardInfo{
-                Name:          shardName,
-                LastMonitored: time.Now(),
-            }
-            shardMutex.Unlock()
-            
-            log.Printf("Finished processing shard: %s", shardName)
-        }(shard)
-    }
-    
-    // Wait for all goroutines to complete
-    wg.Wait()
-    
-    // Print overall summary
-    fmt.Printf("\n===== MONITORING SUMMARY =====\n")
-    fmt.Printf("Total Tasks: %d\n", monitoringSummary.TotalTasks)
-    fmt.Printf("Alive Tasks: %d\n", monitoringSummary.AliveTasks)
-    fmt.Printf("Dead Tasks: %d\n", monitoringSummary.DeadTasks)
-    fmt.Printf("Tasks Updated to Dead: %d\n", monitoringSummary.UpdatedTasks)
-    fmt.Printf("Warning Tasks (approaching timeout): %d\n", monitoringSummary.WarningTasks)
-    fmt.Println(strings.Repeat("=", 30))
-    
-    log.Println("Completed task status check for all shards")
+
+				fmt.Println("\n\n\n\n\n","currentTime=", currentTime.UTC(), "\n\n\n\n\n", "lastChecked=", lastChecked, "\n\n\n\n", "timeSinceLastCheck=", timeSinceLastCheck, "\n\n\n\n\n")
+
+				// Only add time if we have a previous check to compare with
+				if timeSinceLastCheck > 0 {
+					// If currently alive, add to uptime, otherwise add to downtime
+					if status == "alive" {
+						newUptimeSeconds += timeSinceLastCheck
+					} else {
+						newDowntimeSeconds += timeSinceLastCheck
+					}
+				}
+
+				// Update task with new metrics
+				updateQuery := fmt.Sprintf(`
+                    UPDATE %s
+                    SET 
+                        status = $1, 
+                        previous_status = $2, 
+                        last_checked = $3, 
+                        uptime_seconds = $4, 
+                        downtime_seconds = $5
+                    WHERE id = $6;`, shardName)
+
+				_, err = db.Exec(shardCtx, updateQuery,
+					newStatus,
+					status, // Current status becomes previous status
+					currentTime.UTC(),
+					newUptimeSeconds,
+					newDowntimeSeconds,
+					taskID)
+
+				if err != nil {
+					log.Printf("Error updating metrics for task %d in shard %s: %v", taskID, shardName, err)
+				} else {
+					updatedTaskIDs = append(updatedTaskIDs, taskID)
+				}
+
+				// Update counters based on new status
+				if newStatus == "alive" {
+					aliveCount++
+				} else {
+					deadCount++
+				}
+
+				// Check if task is approaching timeout (> 80% of interval passed)
+				isWarning := newStatus == "alive" && timeDiff > float64(interval)*0.8
+				if isWarning {
+					warningCount++
+				}
+
+				// Format the output
+				fmt.Printf("%-5d | %-20s | %-10d | %-8s | %-15s | %-10d | %-15.1f | %-15.1f\n",
+					taskID,
+					truncateString(name, 20),
+					taskNumber,
+					newStatus,
+					lastPing.Format("15:04:05"),
+					interval,
+					newUptimeSeconds,
+					newDowntimeSeconds,
+				)
+			}
+
+			fmt.Printf("\nSHARD SUMMARY: %d total tasks (%d alive, %d dead, %d warnings)\n",
+				aliveCount+deadCount, aliveCount, deadCount, warningCount)
+			fmt.Println(strings.Repeat("=", 50))
+
+			// Update global counters
+			monitoringSummary.Lock()
+			monitoringSummary.TotalTasks += (aliveCount + deadCount)
+			monitoringSummary.AliveTasks += aliveCount
+			monitoringSummary.DeadTasks += deadCount
+			monitoringSummary.UpdatedTasks += len(deadTasks)
+			monitoringSummary.WarningTasks += warningCount
+			monitoringSummary.Unlock()
+
+			// Update last monitored timestamp
+			shardMutex.Lock()
+			shardMonitoringInfo[shardName] = &ShardInfo{
+				Name:          shardName,
+				LastMonitored: time.Now(),
+			}
+			shardMutex.Unlock()
+
+			log.Printf("Finished processing shard %s: Updated %d tasks, marked %d as dead",
+				shardName, len(updatedTaskIDs), len(deadTasks))
+		}(shard)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Print overall summary
+	fmt.Printf("\n===== MONITORING SUMMARY =====\n")
+	fmt.Printf("Total Tasks: %d\n", monitoringSummary.TotalTasks)
+	fmt.Printf("Alive Tasks: %d\n", monitoringSummary.AliveTasks)
+	fmt.Printf("Dead Tasks: %d\n", monitoringSummary.DeadTasks)
+	fmt.Printf("Tasks Updated to Dead: %d\n", monitoringSummary.UpdatedTasks)
+	fmt.Printf("Warning Tasks (approaching timeout): %d\n", monitoringSummary.WarningTasks)
+	fmt.Println(strings.Repeat("=", 30))
+
+	log.Println("Completed task status check for all shards")
 }
 
 // Helper functions for formatting output
 func truncateString(s string, maxLen int) string {
-    if len(s) <= maxLen {
-        return s
-    }
-    return s[:maxLen-3] + "..."
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func warningNote(isWarning bool, interval int, timeDiff float64) string {
-    if !isWarning {
-        return ""
-    }
-    
-    percentRemaining := 100 - (timeDiff * 100 / float64(interval))
-    return fmt.Sprintf(" WARNING: %.1f%% time remaining", percentRemaining)
+	if !isWarning {
+		return ""
+	}
+
+	percentRemaining := 100 - (timeDiff * 100 / float64(interval))
+	return fmt.Sprintf(" WARNING: %.1f%% time remaining", percentRemaining)
 }
 
 func startTaskMonitor() {
-    log.Println("Starting task status monitor...")
-    ticker := time.NewTicker(5 * time.Second)
-    defer ticker.Stop()
+	log.Println("Starting task status monitor...")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-    for range ticker.C {
-        checkTaskStatus()
-    }
+	for range ticker.C {
+		checkTaskStatus()
+	}
 }
