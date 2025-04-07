@@ -60,6 +60,16 @@ type Task struct {
 	DowntimeSeconds float64    `json:"downtime_seconds"`
 }
 
+type TaskGraphPoint struct {
+    ID              int64      `json:"id"`
+    TaskID          int64      `json:"task_id"`
+    Timestamp       time.Time  `json:"timestamp"`
+    Status          string     `json:"status"`
+    UptimeSeconds   float64    `json:"uptime_seconds"`
+    DowntimeSeconds float64    `json:"downtime_seconds"`
+    UptimePercentage float64   `json:"uptime_percentage"`
+}
+
 // JWT secret key - In production, this should be stored securely
 var jwtSecret = []byte("server-lord-secret")
 
@@ -179,10 +189,10 @@ func main() {
 	// r.HandleFunc("/users/{userId}", getUserHandler).Methods("GET")
 	r.HandleFunc("/tasks/{taskId}/heartbeat", heartbeatHandler).Methods("POST")
 
-	// Stats route
-	r.HandleFunc("/api/tasks/{id}/metrics", JWTMiddleware(getTaskMetrics)).Methods("GET", "OPTIONS")
-
-	// Setup CORS
+	// User overview graph - shows combined metrics for all user tasks
+	r.HandleFunc("/api/users/{user_id}/graph", JWTMiddleware(getUserGraph)).Methods("GET", "OPTIONS")
+	
+    // Setup CORS
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"}, // Allow all origins - more permissive for development
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -250,6 +260,17 @@ func initDB(db *pgxpool.Pool) error {
             uptime_seconds FLOAT DEFAULT 0,
             downtime_seconds FLOAT DEFAULT 0
         )`,
+        `CREATE TABLE IF NOT EXISTS task_graph_data (
+            id SERIAL PRIMARY KEY,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status VARCHAR(50) NOT NULL,
+            uptime_seconds FLOAT NOT NULL,
+            downtime_seconds FLOAT NOT NULL,
+            uptime_percentage FLOAT NOT NULL
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_task_graph_data_task_id ON task_graph_data (task_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_task_graph_data_timestamp ON task_graph_data (timestamp)`,
 	}
 
 	for _, query := range queries {
@@ -495,6 +516,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 	log.Printf("✅ Task created successfully with ID: %d", task.ID)
 	respondWithJSON(w, http.StatusCreated, task)
 }
+
 func getTask(w http.ResponseWriter, r *http.Request) {
     vars := mux.Vars(r)
     id, err := strconv.ParseInt(vars["id"], 10, 64)
@@ -763,6 +785,172 @@ func getTaskByID(id int64) (Task, error) {
 	}
 
 	return task, nil
+}
+
+// getUserGraph provides aggregated metrics for all tasks belonging to a user
+func getUserGraph(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    userID, err := strconv.Atoi(vars["user_id"])
+    if err != nil {
+        log.Printf("❌ Invalid user ID: %s", vars["user_id"])
+        respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+        return
+    }
+    
+    log.Printf("📊 Fetching overall graph data for user ID: %d", userID)
+    
+    // First, get all tasks for this user
+    rows, err := db.Query(context.Background(), 
+        "SELECT id FROM tasks WHERE user_id = $1", userID)
+    if err != nil {
+        log.Printf("❌ Error querying user tasks: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error retrieving user tasks")
+        return
+    }
+    defer rows.Close()
+
+    var taskIDs []int64
+    for rows.Next() {
+        var taskID int64
+        if err := rows.Scan(&taskID); err != nil {
+            log.Printf("❌ Error scanning task ID: %v", err)
+            continue
+        }
+        taskIDs = append(taskIDs, taskID)
+    }
+
+    if err = rows.Err(); err != nil {
+        log.Printf("❌ Error iterating tasks: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error processing tasks")
+        return
+    }
+
+    if len(taskIDs) == 0 {
+        log.Printf("👀 No tasks found for user ID: %d", userID)
+        respondWithJSON(w, http.StatusOK, map[string]interface{}{
+            "points": []struct{}{},
+            "user_id": userID,
+            "time_range": "30d",
+            "count": 0,
+        })
+        return
+    }
+
+    // SIMPLIFIED QUERY: Just fetch the actual data points without generating a time series
+    query := `
+        SELECT 
+            timestamp,
+            SUM(CASE WHEN status = 'alive' THEN 1 ELSE 0 END) AS alive_count,
+            SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END) AS dead_count,
+            AVG(uptime_percentage) AS avg_uptime_percentage,
+            SUM(uptime_seconds) AS total_uptime_seconds,
+            SUM(downtime_seconds) AS total_downtime_seconds
+        FROM task_graph_data
+        WHERE task_id = ANY($1) AND timestamp > NOW() - INTERVAL '30 days'
+        GROUP BY timestamp
+        ORDER BY timestamp ASC
+    `
+
+    // Execute the query with pgx's native array support
+    graphRows, err := db.Query(
+        context.Background(),
+        query,
+        taskIDs,  // pgxpool automatically handles arrays correctly
+    )
+    
+    if err != nil {
+        log.Printf("❌ Error querying aggregated graph data: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error retrieving graph data")
+        return
+    }
+    defer graphRows.Close()
+
+    // Prepare response structure
+    type GraphPoint struct {
+        Timestamp          string  `json:"timestamp"`
+        AliveCount         int     `json:"alive_count"`
+        DeadCount          int     `json:"dead_count"`
+        AvgUptimePercentage float64 `json:"avg_uptime_percentage"`
+        TotalUptimeSeconds  float64 `json:"total_uptime_seconds"`
+        TotalDowntimeSeconds float64 `json:"total_downtime_seconds"`
+        TotalTaskCount      int     `json:"total_task_count"`
+        HealthScore         float64 `json:"health_score"`
+    }
+
+    var points []GraphPoint
+    
+    // Process each data point
+    for graphRows.Next() {
+        var (
+            timestamp          time.Time
+            aliveCount         int
+            deadCount          int
+            avgUptimePercentage float64
+            totalUptimeSeconds  float64
+            totalDowntimeSeconds float64
+        )
+
+        if err := graphRows.Scan(
+            &timestamp,
+            &aliveCount,
+            &deadCount,
+            &avgUptimePercentage,
+            &totalUptimeSeconds,
+            &totalDowntimeSeconds,
+        ); err != nil {
+            log.Printf("❌ Error scanning graph data: %v", err)
+            continue
+        }
+
+        // Only include points with actual data (either alive or dead counts)
+        if aliveCount > 0 || deadCount > 0 || 
+            totalUptimeSeconds > 0 || totalDowntimeSeconds > 0 {
+            
+            // Calculate total task count and health score
+            totalTaskCount := aliveCount + deadCount
+            healthScore := 0.0
+            if totalTaskCount > 0 {
+                healthScore = float64(aliveCount) / float64(totalTaskCount) * 100
+            }
+
+            // Add the point to our results
+            points = append(points, GraphPoint{
+                Timestamp:           timestamp.Format(time.RFC3339),
+                AliveCount:          aliveCount,
+                DeadCount:           deadCount,
+                AvgUptimePercentage: avgUptimePercentage,
+                TotalUptimeSeconds:  totalUptimeSeconds,
+                TotalDowntimeSeconds: totalDowntimeSeconds,
+                TotalTaskCount:       totalTaskCount,
+                HealthScore:          healthScore,
+            })
+        }
+    }
+
+    if err = graphRows.Err(); err != nil {
+        log.Printf("❌ Error iterating graph points: %v", err)
+        respondWithError(w, http.StatusInternalServerError, "Error processing graph data")
+        return
+    }
+
+    // Create the final response
+    response := struct {
+        Points    []GraphPoint `json:"points"`
+        UserID    int          `json:"user_id"`
+        TimeRange string       `json:"time_range"`
+        Count     int          `json:"count"`
+        TaskCount int          `json:"task_count"`
+    }{
+        Points:    points,
+        UserID:    userID,
+        TimeRange: "30d",
+        Count:     len(points),
+        TaskCount: len(taskIDs),
+    }
+
+    log.Printf("📊 Retrieved %d actual data points for user ID: %d (covering %d tasks)", 
+        len(points), userID, len(taskIDs))
+    respondWithJSON(w, http.StatusOK, response)
 }
 
 // // old user and task creation handlers
@@ -1189,7 +1377,7 @@ func checkTaskStatus() {
                     timeSinceLastCheck = 0
                 }
 
-				fmt.Println("\n\n\n\n\n","currentTime=", currentTime.UTC(), "\n\n\n\n\n", "lastChecked=", lastChecked, "\n\n\n\n", "timeSinceLastCheck=", timeSinceLastCheck, "\n\n\n\n\n")
+				// fmt.Println("\n\n\n\n\n","currentTime=", currentTime.UTC(), "\n\n\n\n\n", "lastChecked=", lastChecked, "\n\n\n\n", "timeSinceLastCheck=", timeSinceLastCheck, "\n\n\n\n\n")
 
 				// Only add time if we have a previous check to compare with
 				if timeSinceLastCheck > 0 {
@@ -1225,6 +1413,49 @@ func checkTaskStatus() {
 				} else {
 					updatedTaskIDs = append(updatedTaskIDs, taskID)
 				}
+
+                // Calculate uptime percentage for graph data
+                var uptimePercentage float64 = 0
+                if newUptimeSeconds+newDowntimeSeconds > 0 {
+                    uptimePercentage = (newUptimeSeconds / (newUptimeSeconds + newDowntimeSeconds)) * 100
+                }
+
+                // Store graph data point (not affected by sharding since this is a separate table)
+                _, err = db.Exec(
+                    shardCtx,
+                    `INSERT INTO task_graph_data 
+                    (task_id, timestamp, status, uptime_seconds, downtime_seconds, uptime_percentage)
+                    VALUES ($1, $2, $3, $4, $5, $6)`,
+                    taskID,
+                    currentTime.UTC(),
+                    newStatus,
+                    newUptimeSeconds,
+                    newDowntimeSeconds,
+                    uptimePercentage,
+                )
+
+                if err != nil {
+                    log.Printf("Error storing graph data for task %d: %v", taskID, err)
+                }
+
+                // To prevent the graph data table from growing too large, keep only the last 100 points
+                // Run this periodically (every 10th insertion to avoid doing it too often)
+                if taskID%10 == 0 {
+                    _, err = db.Exec(
+                        shardCtx,
+                        `DELETE FROM task_graph_data 
+                        WHERE id IN (
+                            SELECT id FROM task_graph_data 
+                            WHERE task_id = $1 
+                            ORDER BY timestamp DESC 
+                            OFFSET 100
+                        )`,
+                        taskID,
+                    )
+                    if err != nil {
+                        log.Printf("Error pruning graph data for task %d: %v", taskID, err)
+                    }
+                }
 
 				// Update counters based on new status
 				if newStatus == "alive" {
